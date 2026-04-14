@@ -1,6 +1,6 @@
 # 🌟 Immich Management Tool
 
-A Bash script for automated backup, update, and rollback of your [Immich](https://immich.app/) self-hosted installation running via Docker Compose.
+A Bash script for automated backup, update, rollback, and full disk migration of your [Immich](https://immich.app/) self-hosted installation running via Docker Compose.
 
 **Created by:** G.T
 
@@ -11,9 +11,12 @@ A Bash script for automated backup, update, and rollback of your [Immich](https:
 - 🚀 **Auto-Update** — Stops containers, creates a backup, pulls the latest Docker images, and restarts everything automatically.
 - 📦 **Automatic Backup** — Takes a full copy of your Immich directory before every update.
 - ⏪ **Rollback / Restore** — Easily roll back to any previous backup if something goes wrong.
-- 🗑️ **Backup Management** — View and manually delete old backups.
+- 🗑️ **Backup Management** — View, inspect sizes, and manually delete old backups.
+- 💾 **Full Migration** — Move your entire Immich installation (photos, config, database) to a new disk or path.
+- 🆘 **Emergency Undo** — Instantly revert a failed or interrupted migration back to your original setup.
 - 🔍 **Auto-Discovery** — Automatically detects your Immich installation path via Docker labels.
 - 🧹 **Backup Rotation** — Automatically removes old backups, keeping only the number you specify.
+- 🐳 **Docker Compose v1 & v2** — Auto-detects whether to use `docker compose` or `docker-compose`.
 - ⚙️ **Persistent Config** — Saves your settings to a local config file so you don't have to re-enter them every time.
 
 ---
@@ -21,20 +24,27 @@ A Bash script for automated backup, update, and rollback of your [Immich](https:
 ## 📋 Requirements
 
 - Linux system with **Bash**
-- **Docker** and **Docker Compose** (v2, using `docker compose`)
+- **Docker** with either:
+  - Docker Compose **v2** (`docker compose`) — recommended
+  - Docker Compose **v1** (`docker-compose`) — also supported
 - **Root / sudo** privileges
 - Immich running as a Docker Compose stack
+- `rsync` recommended for migration (falls back to `cp` if not available)
 
 ---
 
 ## 🚀 Installation
 
-1. Download or clone the script to your server:
+1. Clone the repository:
+
+```bash
+git clone https://github.com/giannis10/Immich-Management-Tool.git
+```
+
+Or download the script directly:
 
 ```bash
 wget https://raw.githubusercontent.com/giannis10/Immich-Management-Tool/main/immich-management-tool.sh
-# or
-git clone https://github.com/giannis10/Immich-Management-Tool.git
 ```
 
 2. Make it executable:
@@ -59,8 +69,9 @@ On first run, the Setup Wizard will guide you through:
 
 | Step | Description |
 |------|-------------|
-| **Auto-scan** | Optionally scans running Docker containers to find your Immich directory automatically |
-| **Manual path** | If auto-scan fails, you can enter the path manually (e.g. `/opt/immich`) |
+| **Auto-scan** | Scans running Docker containers to find your Immich directory automatically |
+| **Manual path** | If auto-scan fails, enter the path manually (e.g. `/opt/immich`) |
+| **Validation** | Warns you if no `docker-compose.yml` is found in the given path |
 | **Backup location** | Where backups will be stored (default: `/var/backups/immich`) |
 | **Retention policy** | How many old backups to keep before auto-deleting (default: `2`) |
 
@@ -72,33 +83,54 @@ Settings are saved to `immich_update.conf` in the same directory as the script.
 
 ```
 ====================================================
-   🌟 IMMICH MANAGEMENT TOOL 🌟
+    🌟 IMMICH MANAGEMENT TOOL 🌟
 ====================================================
-1) 🚀 Update Immich (Auto-Backup & Update)
-2) ⏪ Restore from Backup (Rollback)
-3) 🗑️ Delete a specific Backup
-4) ⚙️ Change Settings (Run Setup Again)
-5) ❌ Exit
+  📍 Location : /opt/immich
+  📦 Backups  : /var/backups/immich
+  🐳 Compose  : docker compose
+====================================================
+1) 🚀 Update Immich (Pull & Restart)
+2) ⏪ Restore from Backup (Rollback Update)
+3) 🗑️  Manage Backup Files
+4) 💾 Full Migration (Move to New Disk/Path)
+5) 🆘 Emergency Undo (Undo Failed Migration)
+6) ⚙️  Settings (Re-run Setup)
+7) ❌ Exit
 ====================================================
 ```
 
 ### 1 — Update Immich
 Performs the full update cycle:
-1. Stops all Immich containers (`docker compose down`)
+1. Stops all Immich containers
 2. Creates a timestamped backup of your Immich directory
 3. Rotates old backups according to your retention policy
-4. Pulls latest Docker images (`docker compose pull`)
-5. Starts containers back up (`docker compose up -d`)
+4. Pulls latest Docker images
+5. Starts containers back up
+6. If the pull fails, automatically restores the previous version
 
 ### 2 — Restore from Backup
-Lists all available backups (newest first) and lets you choose one to restore. Stops current containers, removes the current installation, and restores the selected backup.
+Lists all available backups (newest first) as a numbered menu and lets you choose one to restore. Stops current containers, clears the current installation, and restores the selected backup.
 
 > ⚠️ **This is a destructive operation.** You must type `YES` (in caps) to confirm.
 
-### 3 — Delete a Backup
-Lists all available backups and lets you permanently delete one manually.
+### 3 — Manage Backups
+Lists all available backups with their **disk size** and lets you permanently delete one to free up space.
 
-### 4 — Change Settings
+### 4 — Full Migration (Move to New Disk/Path)
+Moves your entire Immich installation to a new location. The process:
+1. Stops all containers
+2. Exports a full PostgreSQL database dump to the new location as an extra safety net
+3. Backs up your `.env` and `docker-compose.yml` with a date-stamped copy
+4. Transfers all files using `rsync` (falls back to `cp` if rsync is unavailable)
+5. Updates path references in `.env` and the config file automatically
+6. Starts Immich from the new location
+
+> ⚠️ **The new disk must be formatted as `ext4`, `xfs`, or `zfs`.** Do **not** use NTFS or exFAT — Docker volumes are not compatible with these filesystems.
+
+### 5 — Emergency Undo (Migration Rollback)
+If a migration failed or the terminal closed mid-process, this option detects the backup `.env` file created before the migration and restores it, bringing Immich back online on the original path.
+
+### 6 — Change Settings
 Re-runs the Setup Wizard so you can update the Immich path, backup location, or retention policy.
 
 ---
@@ -108,12 +140,12 @@ Re-runs the Setup Wizard so you can update the Immich path, backup location, or 
 Backups are named using the format:
 
 ```
-immich_backup_DD-MM-YYYY_HH-MM-SS
+immich_backup_YYYYMMDD_HHMMSS
 ```
 
 For example:
 ```
-immich_backup_14-04-2025_03-30-00
+immich_backup_20250414_030000
 ```
 
 ---
@@ -128,21 +160,21 @@ BACKUP_ROOT="/var/backups/immich"
 RETAIN_BACKUPS=2
 ```
 
-You can edit this file manually or use option **4** from the menu.
+You can edit this file manually or use option **6** from the menu.
 
 ---
 
 ## 💡 Tips
 
+- **Keep at least 2 backups** (`RETAIN_BACKUPS=2`) in case the most recent backup itself is corrupted.
+- Backups are **full copies** of your Immich directory. Make sure your backup destination has enough free disk space before updating.
+- **Before migrating**, verify your new disk is mounted and has sufficient space for your entire photo library.
+- **After migrating**, let Immich run for a few days and confirm everything works before deleting data from the old disk.
 - **Run as a cron job** to automate regular updates. Example (every Sunday at 3 AM):
   ```bash
   0 3 * * 0 /path/to/immich-management-tool.sh
   ```
-  > For unattended cron use, you'd need to adapt the script to skip interactive prompts.
-
-- **Keep at least 2 backups** (`RETAIN_BACKUPS=2`) in case the most recent backup itself is corrupted.
-
-- Backups are **full copies** of your Immich directory (using `cp -a`). Make sure your backup destination has enough disk space.
+  > For unattended cron use, the script would need to be adapted to skip interactive prompts.
 
 ---
 
