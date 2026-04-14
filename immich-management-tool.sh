@@ -1,17 +1,29 @@
 #!/bin/bash
 
 # ==============================================================================
-# Immich Management Tool (Auto-Update, Backup, and Rollback)
-# Created by: G.T
+# Immich Management Tool (Ultimate Safety Edition)
+# Created by: G.T | Features: Full Migration, Space Check, Auto-Rollback
 # ==============================================================================
 
-# Define the configuration file path (stored in the same directory as this script)
 CONFIG_FILE="$(dirname "$(readlink -f "$0")")/immich_update.conf"
 BACKUP_PREFIX="immich_backup_"
 
-# Enforce root privileges - required for Docker commands and file permissions
+# ------------------------------------------------------------------------------
+# Colour helpers
+# ------------------------------------------------------------------------------
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+info()    { echo -e "${CYAN}   ℹ️  $*${RESET}"; }
+success() { echo -e "${GREEN}   ✅ $*${RESET}"; }
+warning() { echo -e "${YELLOW}   ⚠️  $*${RESET}"; }
+error()   { echo -e "${RED}   ❌ $*${RESET}"; }
+section() { echo ""; echo "----------------------------------------------------"; echo -e "${BOLD}$*${RESET}"; echo "----------------------------------------------------"; }
+desc()    { echo -e "${CYAN}📝 DESCRIPTION:${RESET}"; echo -e "   $1"; echo ""; }
+
+# Enforce root privileges
 if [ "$EUID" -ne 0 ]; then
-  echo "❌ Error: Please run this script as root or using sudo."
+  error "Please run this script as root or using sudo."
   exit 1
 fi
 
@@ -22,294 +34,274 @@ detect_docker_compose() {
     elif command -v docker-compose &>/dev/null; then
         DOCKER_COMPOSE="docker-compose"
     else
-        echo "❌ Error: Neither 'docker compose' (v2) nor 'docker-compose' (v1) was found."
-        echo "   Please install Docker Compose and try again."
+        error "Docker Compose was not found. Please install it first."
         exit 1
     fi
 }
 
+# ==============================================================================
 # --- FUNCTION: Initial Setup Wizard ---
+# ==============================================================================
 run_setup_wizard() {
     clear
-    echo "===================================================="
-    echo "🔧 Setup Wizard"
-    echo "===================================================="
-    echo ""
+    section "🔧 Setup Wizard"
+    desc "This wizard helps the script learn where your Immich installation is located and where you want to store your backups."
 
     SOURCE_DIR=""
-    
-    # Ask the user if they want to attempt auto-discovery of the Immich path
-    read -p "🔍 Do you want to auto-scan for your Immich installation? (Y/n): " do_scan
+    read -p "🔍 Auto-scan for Immich? (Y/n): " do_scan
     do_scan=${do_scan:-Y}
-
     if [[ "$do_scan" =~ ^[Yy]$ ]]; then
-        echo "⏳ Scanning Docker for running Immich containers..."
-        
-        # Look for a running Immich container and extract its working directory via compose labels
+        info "Scanning Docker for running Immich containers..."
         IMMICH_CONTAINER=$(docker ps --format '{{.Names}}' | grep -i immich | head -n 1)
         if [ -n "$IMMICH_CONTAINER" ]; then
             SOURCE_DIR=$(docker inspect "$IMMICH_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}')
         fi
 
-        # Validate the discovered path
         if [ -n "$SOURCE_DIR" ] && [ -d "$SOURCE_DIR" ]; then
-            echo "✅ Found Immich directory at: $SOURCE_DIR"
+            success "Found Immich directory at: $SOURCE_DIR"
             read -p "Is this correct? (Y/n): " path_correct
             path_correct=${path_correct:-Y}
-            if [[ ! "$path_correct" =~ ^[Yy]$ ]]; then
-                SOURCE_DIR="" 
-            fi
+            [[ ! "$path_correct" =~ ^[Yy]$ ]] && SOURCE_DIR=""
         else
-            echo "⚠️ Could not automatically detect the Immich directory (Is Immich currently running?)."
+            warning "Could not automatically detect the Immich directory."
         fi
     fi
 
-    # Fallback to manual path entry if auto-scan fails or is skipped by the user
     while [ -z "$SOURCE_DIR" ] || [ ! -d "$SOURCE_DIR" ]; do
-        read -p "📁 Please enter the FULL PATH to your Immich directory (where docker-compose.yml is): " SOURCE_DIR
-        if [ ! -d "$SOURCE_DIR" ]; then
-            echo "❌ Directory does not exist. Please try again."
-            SOURCE_DIR=""
-        fi
+        read -p "📁 Enter the FULL PATH to your Immich directory (where docker-compose.yml is): " SOURCE_DIR
+        [ ! -d "$SOURCE_DIR" ] && error "Directory does not exist." && SOURCE_DIR=""
     done
 
-    # Set up backup destination with a sensible default
-    DEFAULT_BACKUP="/var/backups/immich"
-    read -p "📦 Where should backups be saved? [Default: $DEFAULT_BACKUP]: " BACKUP_ROOT
-    BACKUP_ROOT=${BACKUP_ROOT:-$DEFAULT_BACKUP}
+    read -p "📦 Where should backups be saved? [/var/backups/immich]: " BACKUP_ROOT
+    BACKUP_ROOT=${BACKUP_ROOT:-/var/backups/immich}
 
-    # Define backup retention policy
-    DEFAULT_RETAIN=2
-    read -p "🧹 How many old backups do you want to keep automatically? [Default: $DEFAULT_RETAIN]: " RETAIN_BACKUPS
-    RETAIN_BACKUPS=${RETAIN_BACKUPS:-$DEFAULT_RETAIN}
+    while true; do
+        read -p "🧹 How many old backups should I keep? [2]: " RETAIN_BACKUPS
+        RETAIN_BACKUPS=${RETAIN_BACKUPS:-2}
+        [[ "$RETAIN_BACKUPS" =~ ^[1-9][0-9]*$ ]] && break || error "Enter a valid number."
+    done
 
-    # Save preferences to the local config file for future runs
-    echo ""
-    read -p "💾 Save these settings and overwrite previous configuration? (y/N): " confirm_save
-    confirm_save=${confirm_save:-y}
-
-    if [[ "$confirm_save" =~ ^[Yy]$ ]]; then
-        cat <<EOF > "$CONFIG_FILE"
+    cat <<EOF > "$CONFIG_FILE"
 SOURCE_DIR="$SOURCE_DIR"
 BACKUP_ROOT="$BACKUP_ROOT"
 RETAIN_BACKUPS=$RETAIN_BACKUPS
 EOF
-        echo "✅ Setup complete and saved!"
-    else
-        echo "❌ Setup cancelled. Changes were not saved."
-    fi
+    success "Settings saved successfully!"
     sleep 2
 }
 
-# --- FUNCTION: Execute Backup and Update Process ---
+# ==============================================================================
+# --- FUNCTION: Update Process ---
+# ==============================================================================
 perform_update() {
-    echo ""
-    echo "===================================================="
-    echo "🚀 Update Immich"
-    echo "===================================================="
-    
-    # Final sanity check before starting the update process
-    read -p "❓ Ready to create a backup and update Immich? (y/N): " confirm_update
-    confirm_update=${confirm_update:-N}
-    
-    if [[ ! "$confirm_update" =~ ^[Yy]$ ]]; then
-        echo "❌ Update cancelled."
-        read -p "Press Enter to return to menu..."
-        return
-    fi
+    section "🚀 Update Immich"
+    desc "Downloads the latest version. Creates an automatic backup before starting."
 
-    CURRENT_DATE=$(date +%d-%m-%Y_%H-%M-%S)
-    BACKUP_NAME="${BACKUP_PREFIX}${CURRENT_DATE}"
+    cd "$SOURCE_DIR" || { error "Access denied."; return; }
+    read -p "❓ Proceed with the update? (y/N): " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && return
 
-    echo "----------------------------------------------------"
-    
-    cd "$SOURCE_DIR" || exit
-    
-    # Stop containers gracefully to prevent database corruption
-    echo "🛑 Stopping containers gracefully..."
+    info "Stopping containers..."
     $DOCKER_COMPOSE down
 
-    # Ensure the backup directory exists
-    if [ ! -d "$BACKUP_ROOT" ]; then
-        mkdir -p "$BACKUP_ROOT"
+    [ ! -d "$BACKUP_ROOT" ] && mkdir -p "$BACKUP_ROOT"
+
+    local bkp="$BACKUP_ROOT/${BACKUP_PREFIX}$(date +%Y%m%d_%H%M%S)"
+    info "Creating backup at $bkp..."
+    mkdir -p "$bkp"
+
+    if cp -a "$SOURCE_DIR/." "$bkp/"; then
+        success "Backup created."
+    else
+        error "Backup failed! Aborting."
+        $DOCKER_COMPOSE up -d
+        read -p "Press Enter..."; return
     fi
 
-    # Perform the actual backup (using -a to preserve attributes, omitting -v to prevent terminal spam)
-    echo "📦 Creating backup: $BACKUP_NAME..."
-    if cp -a "$SOURCE_DIR" "$BACKUP_ROOT/$BACKUP_NAME"; then
-        echo "✅ Backup created successfully."
+    info "Cleaning up old backups..."
+    cd "$BACKUP_ROOT" || exit
+    ls -td ${BACKUP_PREFIX}* 2>/dev/null | tail -n +$((RETAIN_BACKUPS + 1)) | xargs rm -rf 2>/dev/null
+
+    cd "$SOURCE_DIR" || exit
+    info "Pulling latest images..."
+    if $DOCKER_COMPOSE pull; then
+        $DOCKER_COMPOSE up -d
+        success "Update successful!"
     else
-        echo "❌ Error: Backup failed! Aborting update to protect existing data."
+        error "Pull failed. Restoring previous version..."
+        cp -a "$bkp/." "$SOURCE_DIR/"
+        $DOCKER_COMPOSE up -d
+    fi
+    read -p "Press Enter..."
+}
+
+# ==============================================================================
+# --- FUNCTION: Full Migration with Space Check ---
+# ==============================================================================
+migrate_data() {
+    clear
+    section "💾 Full Migration (New Disk/Path)"
+    desc "Moves EVERYTHING to a new disk. Includes a pre-flight space check."
+
+    warning "CRITICAL: The new disk MUST be formatted as ext4, xfs, or zfs."
+    read -p "❓ Start the migration? (y/N): " proceed
+    [[ ! "$proceed" =~ ^[Yy]$ ]] && return
+
+    read -p "📁 Enter the FULL PATH for the NEW location (e.g., /mnt/newdisk/immich): " NEW_PROJECT_DIR
+    [ -z "$NEW_PROJECT_DIR" ] && return
+    
+    if [ "$(realpath "$NEW_PROJECT_DIR" 2>/dev/null)" = "$(realpath "$SOURCE_DIR")" ]; then
+        error "New path is the same as current path!"
+        read -p "Press Enter..."; return
+    fi
+
+    # --- DISK SPACE CHECK ---
+    section "📊 Step 0: Disk Space Check"
+    info "Calculating source size and available space..."
+    
+    # Get source size in KB
+    local source_size_kb=$(du -sk "$SOURCE_DIR" | awk '{print $1}')
+    
+    # Create destination parent if it doesn't exist to check space correctly
+    mkdir -p "$NEW_PROJECT_DIR"
+    
+    # Get available space on destination in KB
+    local dest_free_kb=$(df -Pk "$NEW_PROJECT_DIR" | awk 'NR==2 {print $4}')
+    
+    # Convert to Human Readable for display
+    local source_human=$(du -sh "$SOURCE_DIR" | awk '{print $1}')
+    local dest_human=$(df -h "$NEW_PROJECT_DIR" | awk 'NR==2 {print $4}')
+
+    info "Source Data Size : $source_human"
+    info "Available Space  : $dest_human"
+
+    if [ "$source_size_kb" -gt "$dest_free_kb" ]; then
+        echo ""
+        error "INSUFFICIENT DISK SPACE!"
+        error "You need at least $source_human, but only $dest_human is available."
+        error "Migration aborted to prevent data corruption."
         read -p "Press Enter to return to menu..."
         return
     fi
+    success "Space check passed. Proceeding..."
 
-    # Handle backup rotation based on user's retention policy
-    echo "🧹 Cleaning up old backups (Keeping the latest $RETAIN_BACKUPS)..."
-    cd "$BACKUP_ROOT" || exit
-    ls -td ${BACKUP_PREFIX}* 2>/dev/null | tail -n +$((RETAIN_BACKUPS + 1)) | while read -r old_backup; do
-        echo "🗑️ Auto-deleting old backup: $old_backup"
-        rm -rf "$old_backup"
-    done
-
-    # Pull the latest images and bring the stack back up
-    echo "🔄 Pulling latest images and starting containers..."
+    section "🛑 Step 1: Preparation & Database Dump"
+    info "Stopping Immich..."
     cd "$SOURCE_DIR" || exit
-    $DOCKER_COMPOSE pull
+    $DOCKER_COMPOSE down
+
+    local db_container=$(docker ps -a --format '{{.Names}}' | grep -i 'postgres' | head -n 1)
+    if [ -n "$db_container" ]; then
+        info "Exporting database dump..."
+        docker start "$db_container" && sleep 5
+        docker exec "$db_container" pg_dumpall -U postgres > "$NEW_PROJECT_DIR/emergency_db_backup.sql"
+        docker stop "$db_container"
+        success "DB exported."
+    fi
+
+    section "🔄 Step 2: Transferring Data"
+    local date_suffix=$(date +%Y%m%d)
+    [ -f ".env" ] && cp ".env" ".env.migbak_${date_suffix}"
+    [ -f "docker-compose.yml" ] && cp "docker-compose.yml" "docker-compose.yml.migbak_${date_suffix}"
+    
+    info "Copying files (this may take a long time)..."
+    if rsync -a --info=progress2 --checksum "$SOURCE_DIR/" "$NEW_PROJECT_DIR/"; then
+        success "Files transferred."
+    else
+        error "Transfer failed! Check disk connection."
+        read -p "Press Enter..."; return
+    fi
+
+    section "⚙️ Step 3: Updating Paths"
+    [ -f "$NEW_PROJECT_DIR/.env" ] && sed -i "s|$SOURCE_DIR|$NEW_PROJECT_DIR|g" "$NEW_PROJECT_DIR/.env"
+    sed -i "s|SOURCE_DIR=.*|SOURCE_DIR=\"$NEW_PROJECT_DIR\"|" "$CONFIG_FILE"
+    
+    section "▶️ Step 4: Launching"
+    cd "$NEW_PROJECT_DIR" || exit
     $DOCKER_COMPOSE up -d
-
-    echo "🎉 Immich successfully updated!"
-    read -p "Press Enter to return to menu..."
+    
+    success "Migration successful! Immich is running from $NEW_PROJECT_DIR"
+    warning "Verify everything before deleting old data at $SOURCE_DIR."
+    
+    source "$CONFIG_FILE"
+    read -p "Press Enter..."
 }
 
-# --- FUNCTION: Restore/Rollback from an existing backup ---
+# ==============================================================================
+# --- OTHER FUNCTIONS ---
+# ==============================================================================
 restore_backup() {
-    echo ""
-    echo "===================================================="
-    echo "⏪ Restore a Previous Backup"
-    echo "===================================================="
-    
-    if [ ! -d "$BACKUP_ROOT" ]; then
-        echo "❌ Backup directory not found."
-        read -p "Press Enter to return..."
-        return
-    fi
-
+    section "⏪ Restore Backup"
+    [ ! -d "$BACKUP_ROOT" ] && { error "No backups."; return; }
     cd "$BACKUP_ROOT" || exit
-    
-    # Fetch all available backups, sorted by newest first, and store them in an array
     mapfile -t BACKUPS < <(ls -dt ${BACKUP_PREFIX}* 2>/dev/null)
-
-    if [ ${#BACKUPS[@]} -eq 0 ]; then
-        echo "⚠️ No backups found to restore."
-        read -p "Press Enter to return..."
-        return
-    fi
-
-    # Display available backups as a numbered list
-    echo "Available backups:"
-    for i in "${!BACKUPS[@]}"; do
-        echo "$((i+1))) ${BACKUPS[$i]}"
-    done
-    echo "0) Cancel"
-
-    read -p "Select a backup to restore [0-$(( ${#BACKUPS[@]} ))]: " choice
-
-    if [[ "$choice" -eq 0 ]]; then
-        return
-    elif [[ "$choice" -gt 0 && "$choice" -le "${#BACKUPS[@]}" ]]; then
-        SELECTED_BACKUP="${BACKUPS[$((choice-1))]}"
-        
-        echo "⚠️ WARNING: This will overwrite your current Immich installation at $SOURCE_DIR!"
-        read -p "❓ Are you absolutely sure? (Type YES to confirm): " confirm
-        
-        if [ "$confirm" = "YES" ]; then
-            echo "🛑 Stopping current containers..."
+    [ ${#BACKUPS[@]} -eq 0 ] && { error "No backups."; return; }
+    
+    for i in "${!BACKUPS[@]}"; do echo "   $((i+1))) ${BACKUPS[$i]}"; done
+    read -p "👉 Selection [0 for cancel]: " choice
+    if [[ "$choice" -gt 0 && "$choice" -le "${#BACKUPS[@]}" ]]; then
+        local SEL="${BACKUPS[$((choice-1))]}"
+        read -p "Confirm overwrite? (Type YES): " conf
+        if [ "$conf" = "YES" ]; then
             cd "$SOURCE_DIR" && $DOCKER_COMPOSE down
-            
-            echo "🗑️ Removing current corrupted/old files..."
-            rm -rf "$SOURCE_DIR"
-            
-            echo "⏪ Restoring from $SELECTED_BACKUP..."
-            cp -a "$BACKUP_ROOT/$SELECTED_BACKUP" "$SOURCE_DIR"
-            
-            echo "▶️ Starting restored containers..."
-            cd "$SOURCE_DIR" && $DOCKER_COMPOSE up -d
-            echo "✅ Restore completed successfully!"
-        else
-            echo "❌ Restore cancelled."
+            rm -rf "${SOURCE_DIR:?}"/*
+            cp -a "$BACKUP_ROOT/$SEL/." "$SOURCE_DIR/"
+            $DOCKER_COMPOSE up -d
+            success "Restored."
         fi
-    else
-        echo "❌ Invalid choice."
     fi
-    read -p "Press Enter to return to menu..."
+    read -p "Press Enter..."
 }
 
-# --- FUNCTION: Manual Backup Management ---
-manage_backups() {
-    echo ""
-    echo "===================================================="
-    echo "🗑️ Manage Backups"
-    echo "===================================================="
-    
-    cd "$BACKUP_ROOT" 2>/dev/null || { echo "❌ Backup directory not found."; read -p "Press Enter..."; return; }
-    
-    mapfile -t BACKUPS < <(ls -dt ${BACKUP_PREFIX}* 2>/dev/null)
-
-    if [ ${#BACKUPS[@]} -eq 0 ]; then
-        echo "⚠️ No backups found."
-        read -p "Press Enter to return..."
-        return
-    fi
-
-    echo "Available backups:"
-    for i in "${!BACKUPS[@]}"; do
-        echo "$((i+1))) ${BACKUPS[$i]}"
-    done
-    echo "0) Cancel"
-
-    read -p "Select a backup to DELETE [0-$(( ${#BACKUPS[@]} ))]: " choice
-
-    if [[ "$choice" -eq 0 ]]; then
-        return
-    elif [[ "$choice" -gt 0 && "$choice" -le "${#BACKUPS[@]}" ]]; then
-        SELECTED_BACKUP="${BACKUPS[$((choice-1))]}"
-        
-        # Extra safety layer: explicit confirmation before permanent deletion
-        read -p "❓ Are you sure you want to PERMANENTLY delete '$SELECTED_BACKUP'? (y/N): " confirm_delete
-        confirm_delete=${confirm_delete:-N}
-        
-        if [[ "$confirm_delete" =~ ^[Yy]$ ]]; then
-            echo "🗑️ Deleting $SELECTED_BACKUP..."
-            rm -rf "$SELECTED_BACKUP"
-            echo "✅ Backup deleted."
-        else
-            echo "❌ Deletion cancelled."
+manual_migration_undo() {
+    section "🆘 Emergency Undo"
+    local env_bak=$(ls -t "$SOURCE_DIR"/.env.migbak_* 2>/dev/null | head -n 1)
+    if [ -n "$env_bak" ]; then
+        read -p "Rollback to old path? (y/N): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            cd "$SOURCE_DIR" && $DOCKER_COMPOSE down
+            cp "$env_bak" .env
+            $DOCKER_COMPOSE up -d
+            success "Rollback complete."
         fi
     else
-        echo "❌ Invalid choice."
+        error "No recovery files."
     fi
-    read -p "Press Enter to return to menu..."
+    read -p "Press Enter..."
 }
 
-# --- MAIN ENTRY POINT ---
-
-# Detect which Docker Compose command is available on this system
+# ==============================================================================
+# --- MAIN MENU ---
+# ==============================================================================
 detect_docker_compose
-
-# Trigger the setup wizard if no config file is found
-if [ ! -f "$CONFIG_FILE" ]; then
-    run_setup_wizard
-fi
-
-# Load saved user variables
+[ ! -f "$CONFIG_FILE" ] && run_setup_wizard
 source "$CONFIG_FILE"
 
-# Main interactive menu loop
 while true; do
     clear
     echo "===================================================="
-    echo "   🌟 IMMICH MANAGEMENT TOOL 🌟"
+    echo -e "${BOLD}    🌟 IMMICH MANAGEMENT TOOL 🌟${RESET}"
     echo "             Created by G.T"
     echo "===================================================="
-    echo "   📍 Path: $SOURCE_DIR"
-    echo "   📦 Backups: $BACKUP_ROOT"
-    echo "   🐳 Docker Compose: $DOCKER_COMPOSE"
+    echo -e "  📍 Location : ${CYAN}$SOURCE_DIR${RESET}"
+    echo -e "  📦 Backups  : ${CYAN}$BACKUP_ROOT${RESET}"
     echo "===================================================="
-    echo "1) 🚀 Update Immich (Auto-Backup & Update)"
-    echo "2) ⏪ Restore from Backup (Rollback)"
-    echo "3) 🗑️ Delete a specific Backup"
-    echo "4) ⚙️ Change Settings (Run Setup Again)"
-    echo "5) ❌ Exit"
+    echo "1) 🚀 Update Immich"
+    echo "2) ⏪ Restore from Backup"
+    echo "3) 💾 Full Migration (New Disk/Path)"
+    echo "4) 🆘 Emergency Undo"
+    echo "5) ⚙️  Settings / Re-run Setup"
+    echo "6) ❌ Exit"
     echo "===================================================="
-    read -p "👉 Choose an option [1-5]: " MENU_CHOICE
+    read -p "👉 Choice [1-6]: " CHOICE
 
-    case $MENU_CHOICE in
+    case $CHOICE in
         1) perform_update ;;
         2) restore_backup ;;
-        3) manage_backups ;;
-        4) run_setup_wizard; source "$CONFIG_FILE" ;;
-        5) echo "Goodbye!"; exit 0 ;;
-        *) echo "❌ Invalid option!"; sleep 1 ;;
+        3) migrate_data ;;
+        4) manual_migration_undo ;;
+        5) run_setup_wizard; source "$CONFIG_FILE" ;;
+        6) exit 0 ;;
+        *) sleep 1 ;;
     esac
 done
