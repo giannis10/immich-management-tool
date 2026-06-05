@@ -27,6 +27,123 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# ==============================================================================
+# --- FUNCTION: Version Check ---
+# ==============================================================================
+get_current_version() {
+    # Try to get version from running immich-server container
+    local version=""
+    
+    # Method 1: Read from container environment variable
+    local container
+    container=$(docker ps --format '{{.Names}}' | grep -i 'immich.server\|immich-server' | head -n 1)
+    if [ -z "$container" ]; then
+        container=$(docker ps --format '{{.Names}}' | grep -i 'immich' | grep -v 'postgres\|redis\|machine' | head -n 1)
+    fi
+
+    if [ -n "$container" ]; then
+        version=$(docker exec "$container" printenv IMMICH_VERSION 2>/dev/null)
+        if [ -z "$version" ]; then
+            # Method 2: Read from Docker image tag
+            version=$(docker inspect "$container" --format '{{.Config.Image}}' 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        fi
+        if [ -z "$version" ]; then
+            # Method 3: Read from image labels
+            version=$(docker inspect "$container" --format '{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null)
+        fi
+    fi
+
+    # Method 4: Read from .env file in SOURCE_DIR
+    if [ -z "$version" ] && [ -f "$SOURCE_DIR/.env" ]; then
+        version=$(grep -E '^IMMICH_VERSION=' "$SOURCE_DIR/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+        [ "$version" = "release" ] || [ "$version" = "" ] && version=""
+    fi
+
+    # Method 5: Read from docker-compose.yml image tag
+    if [ -z "$version" ] && [ -f "$SOURCE_DIR/docker-compose.yml" ]; then
+        version=$(grep -oE 'ghcr\.io/immich-app/immich-server:v[0-9]+\.[0-9]+\.[0-9]+' "$SOURCE_DIR/docker-compose.yml" 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    fi
+
+    echo "${version:-unknown}"
+}
+
+get_latest_version() {
+    # Fetch latest release tag from GitHub API
+    local latest=""
+    if command -v curl &>/dev/null; then
+        latest=$(curl -sf --max-time 10 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/immich-app/immich/releases/latest" \
+            | grep -oE '"tag_name":\s*"v[^"]*"' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    elif command -v wget &>/dev/null; then
+        latest=$(wget -qO- --timeout=10 \
+            "https://api.github.com/repos/immich-app/immich/releases/latest" \
+            | grep -oE '"tag_name":\s*"v[^"]*"' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    fi
+    echo "${latest:-unknown}"
+}
+
+check_versions() {
+    clear
+    section "🔍 Immich Version Check"
+    desc "Checks your currently installed Immich version and the latest available release on GitHub."
+
+    info "Detecting installed version..."
+    local current
+    current=$(get_current_version)
+
+    info "Fetching latest version from GitHub..."
+    local latest
+    latest=$(get_latest_version)
+
+    echo ""
+    echo "===================================================="
+    if [ "$current" = "unknown" ]; then
+        echo -e "  📦 Installed Version : ${YELLOW}Could not detect${RESET}"
+        warning "Immich may not be running, or the container name is non-standard."
+    else
+        echo -e "  📦 Installed Version : ${CYAN}${BOLD}$current${RESET}"
+    fi
+
+    if [ "$latest" = "unknown" ]; then
+        echo -e "  🌐 Latest Version    : ${YELLOW}Could not fetch (no internet?)${RESET}"
+    else
+        echo -e "  🌐 Latest Version    : ${GREEN}${BOLD}$latest${RESET}"
+    fi
+    echo "===================================================="
+
+    # Compare versions and give advice
+    if [ "$current" != "unknown" ] && [ "$latest" != "unknown" ]; then
+        echo ""
+        # Strip 'v' prefix for comparison
+        local cur_clean="${current#v}"
+        local lat_clean="${latest#v}"
+
+        if [ "$cur_clean" = "$lat_clean" ]; then
+            success "You are already on the latest version! ✨"
+        else
+            # Simple semver comparison using sort -V
+            local older
+            older=$(printf '%s\n%s' "$cur_clean" "$lat_clean" | sort -V | head -n 1)
+            if [ "$older" = "$cur_clean" ]; then
+                echo -e "  ${YELLOW}⬆️  An update is available: ${BOLD}$current${RESET}${YELLOW} → ${BOLD}$latest${RESET}"
+                echo ""
+                read -p "   Would you like to update now? (y/N): " do_update
+                if [[ "$do_update" =~ ^[Yy]$ ]]; then
+                    perform_update
+                    return
+                fi
+            else
+                warning "Your version ($current) appears newer than the latest release ($latest)."
+                info "You may be running a release candidate or custom build."
+            fi
+        fi
+    fi
+
+    echo ""
+    read -p "Press Enter to return to menu..."
+}
+
 # --- FUNCTION: Detect Docker Compose command ---
 detect_docker_compose() {
     if docker compose version &>/dev/null; then
@@ -285,23 +402,42 @@ while true; do
     echo "===================================================="
     echo -e "  📍 Location : ${CYAN}$SOURCE_DIR${RESET}"
     echo -e "  📦 Backups  : ${CYAN}$BACKUP_ROOT${RESET}"
+
+    # --- Inline version display in menu ---
+    CURRENT_VER=$(get_current_version)
+    LATEST_VER=$(get_latest_version)
+    if [ "$CURRENT_VER" = "unknown" ]; then
+        echo -e "  🔖 Version  : ${YELLOW}Not detected${RESET}"
+    elif [ "$LATEST_VER" != "unknown" ] && [ "${CURRENT_VER#v}" != "${LATEST_VER#v}" ]; then
+        OLDER=$(printf '%s\n%s' "${CURRENT_VER#v}" "${LATEST_VER#v}" | sort -V | head -n 1)
+        if [ "$OLDER" = "${CURRENT_VER#v}" ]; then
+            echo -e "  🔖 Version  : ${YELLOW}$CURRENT_VER${RESET} ${YELLOW}(update available: ${BOLD}$LATEST_VER${RESET}${YELLOW})${RESET}"
+        else
+            echo -e "  🔖 Version  : ${CYAN}$CURRENT_VER${RESET} ${GREEN}(newer than release)${RESET}"
+        fi
+    else
+        echo -e "  🔖 Version  : ${GREEN}$CURRENT_VER${RESET} ${GREEN}(up to date)${RESET}"
+    fi
+
     echo "===================================================="
     echo "1) 🚀 Update Immich"
     echo "2) ⏪ Restore from Backup"
     echo "3) 💾 Full Migration (New Disk/Path)"
     echo "4) 🆘 Emergency Undo"
-    echo "5) ⚙️  Settings / Re-run Setup"
-    echo "6) ❌ Exit"
+    echo "5) 🔍 Version Check"
+    echo "6) ⚙️  Settings / Re-run Setup"
+    echo "7) ❌ Exit"
     echo "===================================================="
-    read -p "👉 Choice [1-6]: " CHOICE
+    read -p "👉 Choice [1-7]: " CHOICE
 
     case $CHOICE in
         1) perform_update ;;
         2) restore_backup ;;
         3) migrate_data ;;
         4) manual_migration_undo ;;
-        5) run_setup_wizard; source "$CONFIG_FILE" ;;
-        6) exit 0 ;;
+        5) check_versions ;;
+        6) run_setup_wizard; source "$CONFIG_FILE" ;;
+        7) exit 0 ;;
         *) sleep 1 ;;
     esac
 done
